@@ -1,0 +1,25 @@
+{
+  "name": "restep-sync",
+  "version": "0.1.0",
+  "description": "Cliente offline-first para APIs Restep 1: réplica local con el perfil sync y cola de escrituras",
+  "type": "module",
+  "main": "restep-sync.mjs",
+  "exports": {
+    ".": "./restep-sync.mjs"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/restep-spec/restep-sync.git"
+  },
+  "homepage": "https://restep.wubytes.com/tools/",
+  "bugs": {
+    "url": "https://github.com/restep-spec/restep-sync/issues"
+  },
+  "scripts": {
+    "test": "node test.mjs"
+  }
+}
