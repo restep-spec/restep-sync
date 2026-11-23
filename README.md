@@ -9,6 +9,10 @@ Biblioteca cliente offline-first para APIs [Restep 1](https://restep.wubytes.com
 `"restep": "1.0-draft.6"`, el único texto de `sync` que implementa (`KNOWN_TEXTS`). Con
 cualquier otra versión de Restep 1 recarga las colecciones enteras.
 
+```bash
+npm install restep-sync
+```
+
 ## Uso
 
 ```js
