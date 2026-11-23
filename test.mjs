@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { buildSyncServer } from './ref-sync-server.mjs';
 import { openRestepSync, fileStorage, memoryStorage } from './restep-sync.mjs';
 
-const SERVER_PORT = 8860, PROXY_PORT = 8861;
+const SERVER_PORT = 8860, PROXY_PORT = 8861, OTHER_PORT = 8862; // OTHER: otro origen, para §4.3
 const SERVER = `http://localhost:${SERVER_PORT}`, API = `http://localhost:${PROXY_PORT}/`;
 
 // ── Utilidades ──
@@ -35,7 +35,7 @@ async function api(method, path, body, headers = {}) {
 async function serverItems(coll) {
   const items = [];
   for (let next = `/${coll}?limit=50`; next;) { const r = await api('GET', next); items.push(...r.body.items); next = r.body.next; }
-  return items.sort((a, b) => a.id.localeCompare(b.id));
+  return items.map(({ _etag, ...it }) => it).sort((a, b) => a.id.localeCompare(b.id));
 }
 const localItems = (db, coll) => db.list(coll).sort((a, b) => a.id.localeCompare(b.id));
 async function sameAsServer(db, coll) { eq(localItems(db, coll), await serverItems(coll), `${coll}: copia local distinta de la del servidor`); }
@@ -57,9 +57,11 @@ async function stopServer() {
   await done;
 }
 
-const proxy = { requests: [], dropNext: null, injectNext: null };
+// rewrite(req, status, cuerpo) puede devolver otro cuerpo JSON (para simular otros descubrimientos).
+const proxy = { requests: [], dropNext: null, injectNext: null, rewrite: null, headers: [] };
 const proxyServer = createServer((req, res) => {
   proxy.requests.push(`${req.method} ${req.url}`);
+  proxy.headers.push({ line: `${req.method} ${req.url}`, headers: req.headers });
   if (proxy.injectNext) {
     const { status, headers, body } = proxy.injectNext; proxy.injectNext = null;
     res.writeHead(status, { 'content-type': 'application/problem+json', ...headers });
@@ -72,13 +74,36 @@ const proxyServer = createServer((req, res) => {
     ur.on('end', () => {
       if (req.method === 'POST') proxy.lastPost = { status: ur.statusCode, headers: ur.headers };
       if (drop) return req.socket.destroy(); // el servidor hizo el trabajo, pero la respuesta se pierde
-      res.writeHead(ur.statusCode, ur.headers); res.end(Buffer.concat(chunks));
+      let body = Buffer.concat(chunks);
+      if (proxy.rewrite && body.length && /json/.test(ur.headers['content-type'] ?? '')) {
+        const out = proxy.rewrite(req, ur.statusCode, JSON.parse(body));
+        if (out !== undefined) {
+          body = Buffer.from(JSON.stringify(out));
+          const { 'content-length': _, etag: __, ...rest } = ur.headers;
+          return res.writeHead(ur.statusCode, rest), res.end(body);
+        }
+      }
+      res.writeHead(ur.statusCode, ur.headers); res.end(body);
     });
   });
   up.on('error', () => req.socket.destroy()); // servidor parado: para el cliente, sin conexión
   req.pipe(up);
 });
 await new Promise((r) => proxyServer.listen(PROXY_PORT, r));
+// Otro origen: apunta las cabeceras que recibe y responde una página vacía.
+const other = { seen: [] };
+const otherServer = createServer((req, res) => {
+  other.seen.push(req.headers);
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({ items: [], next: null, state: 'x' }));
+});
+await new Promise((r) => otherServer.listen(OTHER_PORT, r));
+// Un descubrimiento modificado: f recibe una copia y la cambia.
+const onRoot = (f) => (req, status, body) => {
+  if (req.method !== 'GET' || req.url !== '/' || status !== 200) return undefined;
+  const doc = structuredClone(body);
+  return f(doc) ?? doc;
+};
 
 const dir = await mkdtemp(join(tmpdir(), 'restep-sync-test-'));
 const file = join(dir, 'replica.json');
@@ -123,7 +148,7 @@ try {
     await sameAsServer(db, 'books');
   });
 
-  await check('cambio en otra colección por herencia (5.7): borrar una categoría cambia a sus hijas', async () => {
+  await check('cambio en otra colección por herencia (11.6): borrar una categoría cambia a sus hijas', async () => {
     await api('DELETE', '/categories/2'); // la 4 hereda de la 2: pierde el enlace y cambia su tax_rate
     const r = await db.sync();
     eq(r.pulled.categories, { created: 0, updated: 1, destroyed: 1 }, 'cambios de categories');
@@ -183,11 +208,25 @@ try {
         return { title: `${local.title} + remoto` };
       },
     });
-    await api('PATCH', '/books/30', { price: '99.00' }); // sin ETag en la colección: se detecta al releer
+    await api('PATCH', '/books/30', { price: '99.00' }); // el _etag del listado ya no vale: 412 y se relee
     const r = await db.sync();
     eq(r.conflicts, 1, 'un conflicto');
     const now = (await api('GET', '/books/30')).body;
     eq([now.title, now.price], ['Cuaderno de faros (local) + remoto', '99.00'], 'fusión aplicada');
+    await sameAsServer(db, 'books');
+  });
+
+  await check('_etag del listado (7.2): escribe con If-Match sin leer antes el elemento', async () => {
+    const listed = (await api('GET', '/books?filter[id][in]=21')).body.items[0];
+    assert(typeof listed?._etag === 'string', 'el servidor pone _etag en el listado');
+    await db.sync();
+    await db.update('books', '21', { rating: 4.2 });
+    proxy.requests.length = 0;
+    const r = await db.sync();
+    eq([r.pushed, r.conflicts], [1, 0], 'enviada sin conflicto');
+    const i = proxy.requests.indexOf('PATCH /books/21');
+    assert(i >= 0 && !proxy.requests.slice(0, i).includes('GET /books/21'), `no relee antes: ${proxy.requests.join(', ')}`);
+    assert(!('_etag' in db.get('books', '21')), 'el _etag no forma parte de los datos locales');
     await sameAsServer(db, 'books');
   });
 
@@ -230,6 +269,28 @@ try {
     const r3 = await db.sync();
     eq([r3.pushed, r3.pending], [1, 0], 'pasado el plazo, se envía');
     eq((await serverItems('books')).filter((b) => b.title === 'Paciencia').length, 1, 'uno solo');
+  });
+
+  await check('409 request_in_progress: se reintenta después de Retry-After', async () => {
+    await db.create('books', { title: 'En curso', price: '4.50' });
+    proxy.injectNext = { status: 409, headers: { 'retry-after': '1' }, body: { status: 409, code: 'request_in_progress', title: 'Conflicto' } };
+    const r1 = await db.sync();
+    eq([r1.pending, r1.dropped], [1, 0], 'sigue pendiente');
+    assert(r1.waitingUntil > Date.now() + 500, 'espera lo que dice Retry-After');
+    await wait(1100);
+    const r2 = await db.sync();
+    eq([r2.pushed, r2.pending], [1, 0], 'pasado el plazo, se envía');
+    eq((await serverItems('books')).filter((b) => b.title === 'En curso').length, 1, 'uno solo');
+  });
+
+  await check('409 conflict: permanente, se quita de la cola y se deshace', async () => {
+    const item = await db.create('books', { title: 'Duplicado', price: '4.50' });
+    events.error.length = 0;
+    proxy.injectNext = { status: 409, headers: {}, body: { status: 409, code: 'conflict', title: 'Conflicto' } };
+    const r = await db.sync();
+    eq([r.dropped, r.pending], [1, 0], 'descartada sin reintentar');
+    eq(events.error[0]?.error.problem.code, 'conflict', 'evento error con el problem+json');
+    eq(db.get('books', item.id), null, 'el elemento optimista desaparece');
   });
 
   await check('error permanente (422): se quita de la cola, se deshace y se avisa', async () => {
@@ -288,6 +349,183 @@ try {
     } finally { await bg.close(); }
   });
 
+  await check('colección sin sync (§10): se recarga entera y nunca pide :changes', async () => {
+    eq((await api('GET', '/products:changes?since=x')).status, 404, ':changes de una colección sin sync');
+    const p = await openRestepSync({ url: API, collections: ['products', 'books'], interval: 0, autoPush: false });
+    try {
+      eq([p.mode('products'), p.mode('books')], ['reload', 'sync'], 'modos');
+      proxy.requests.length = 0;
+      await p.sync();
+      await api('PATCH', '/products/2', { price: '7.00' });
+      const r = await p.sync();
+      eq(r.pulled.products.updated, 1, 'el cambio llega recargando');
+      assert(!proxy.requests.some((x) => x.includes('products:changes')), `no pide :changes: ${proxy.requests.join(', ')}`);
+      eq(p.get('products', '2').price, '7.00', 'precio al día');
+    } finally { await p.close(); }
+  });
+
+  await check('texto de sync desconocido (§1.2): con "1.0-draft.5" o "1.1" no usa :changes', async () => {
+    for (const version of ['1.0-draft.5', '1.1']) {
+      proxy.rewrite = onRoot((d) => { d.restep = version; });
+      const p = await openRestepSync({ url: API, collections: ['books'], interval: 0, autoPush: false });
+      proxy.rewrite = null;
+      try {
+        eq(p.mode('books'), 'reload', `modo con ${version}`);
+        proxy.requests.length = 0;
+        await p.sync(); await p.sync();
+        assert(!proxy.requests.some((x) => x.includes(':changes')), `${version}: no pide :changes`);
+        await sameAsServer(p, 'books');
+      } finally { await p.close(); }
+    }
+  });
+
+  await check('otra versión mayor o restep mal formado: no es Restep 1 y no abre (§1.1)', async () => {
+    for (const version of ['2.0', '1.01', '1.0-beta.1']) {
+      proxy.rewrite = onRoot((d) => { d.restep = version; });
+      let msg = '';
+      try { await openRestepSync({ url: API, collections: ['books'], interval: 0 }); } catch (e) { msg = e.message; }
+      proxy.rewrite = null;
+      assert(msg.includes('no es Restep 1'), `${version}: ${msg}`);
+    }
+  });
+
+  await check('sin descubrimiento (§4.2): solo core, la colección en /<nombre>, recargando', async () => {
+    proxy.rewrite = onRoot(() => ({ hola: 'no soy un descubrimiento' }));
+    const p = await openRestepSync({ url: API, collections: ['books'], interval: 0, autoPush: false });
+    try {
+      eq(p.mode('books'), 'reload', 'modo');
+      await p.sync();
+      await sameAsServer(p, 'books');
+      // Sin writes anunciado no hay Idempotency-Key (§7.1).
+      proxy.headers.length = 0;
+      await p.create('books', { title: 'Solo core', price: '1.00' });
+      await p.sync();
+      const post = proxy.headers.find((x) => x.line === 'POST /books');
+      assert(post && post.headers['idempotency-key'] === undefined, 'sin Idempotency-Key');
+      eq(post.headers['content-type'], 'application/json', 'Content-Type del POST (§3)');
+    } finally { proxy.rewrite = null; await p.close(); }
+  });
+
+  await check('una subcolección real de la referencia (reviews, sin sync): error claro al abrir, y su :changes da 404', async () => {
+    eq((await api('GET', '/books/7/reviews:changes?since=x')).status, 404, ':changes de una subcolección');
+    let msg = '';
+    try { await openRestepSync({ url: API, collections: ['reviews'], interval: 0 }); } catch (e) { msg = e.message; }
+    assert(msg.includes('subcolección') && msg.includes('/books/{book_id}/reviews'), msg);
+  });
+
+  await check('subcolección con plantilla: error claro al abrir', async () => {
+    proxy.rewrite = onRoot((d) => { d.collections.books.path = '/shelves/{shelf_id}/books'; d.collections.books.parent = 'shelves'; });
+    let msg = '';
+    try { await openRestepSync({ url: API, collections: ['books'], interval: 0 }); } catch (e) { msg = e.message; }
+    proxy.rewrite = null;
+    assert(msg.includes('subcolección'), msg);
+  });
+
+  await check('id_from (§5.1): con "client" elige el id el cliente, sin alias; con "server" no deja elegirlo', async () => {
+    proxy.rewrite = onRoot((d) => { d.collections.categories.id_from = 'client'; });
+    const p = await openRestepSync({ url: API, collections: ['categories', 'books'], interval: 0, autoPush: false });
+    proxy.rewrite = null;
+    try {
+      const cat = await p.create('categories', { name: `Elegida ${Date.now()}` });
+      assert(/^[0-9a-f-]{36}$/.test(cat.id), `un UUID: ${cat.id}`);
+      proxy.headers.length = 0;
+      const r = await p.sync();
+      eq([r.pushed, r.pending], [1, 0], 'enviada');
+      const post = proxy.headers.find((x) => x.line === 'POST /categories');
+      assert(post, 'hay POST');
+      eq(p.resolveId('categories', cat.id), cat.id, 'sin alias: el id ya es el definitivo');
+      eq((await api('GET', `/categories/${cat.id}`)).status, 200, 'el servidor lo tiene con ese id');
+      let msg = '';
+      try { await p.create('books', { id: 'mio', title: 'No', price: '1.00' }); } catch (e) { msg = e.message; }
+      assert(msg.includes('no deja elegir el id'), msg);
+    } finally { await p.close(); }
+  });
+
+  await check('id propio y respuesta perdida, sin writes: el 409 taken se lee y se confirma (§5.1)', async () => {
+    proxy.rewrite = onRoot((d) => { d.profiles = d.profiles.filter((x) => x !== 'writes'); d.collections.categories.id_from = 'client'; });
+    const p = await openRestepSync({ url: API, collections: ['categories'], interval: 0, autoPush: false });
+    proxy.rewrite = null;
+    try {
+      const cat = await p.create('categories', { name: `Perdida ${Date.now()}` });
+      proxy.dropNext = (req) => req.method === 'POST';
+      proxy.headers.length = 0;
+      const r1 = await p.sync();
+      eq([r1.online, r1.pending, r1.uncertain], [false, 1, undefined], 'sin respuesta, pendiente y no incierta');
+      assert(proxy.headers.find((x) => x.line === 'POST /categories')?.headers['idempotency-key'] === undefined, 'sin Idempotency-Key');
+      const r2 = await p.sync();
+      eq([r2.pushed, r2.pending, r2.dropped], [1, 0, 0], 'confirmada tras el 409 taken');
+      eq(p.get('categories', cat.id)?.name, cat.name, 'en la copia local');
+      eq((await serverItems('categories')).filter((c) => c.name === cat.name).length, 1, 'una sola en el servidor');
+    } finally { await p.close(); }
+  });
+
+  await check('sin writes ni id propio: un create con respuesta perdida no se repite solo (§5.7)', async () => {
+    proxy.rewrite = onRoot((d) => { d.profiles = d.profiles.filter((x) => x !== 'writes'); });
+    const p = await openRestepSync({ url: API, collections: ['books'], interval: 0, autoPush: false });
+    proxy.rewrite = null;
+    const errors = [];
+    p.on('error', (e) => errors.push(e));
+    try {
+      const title = `Incierto ${Date.now()}`;
+      await p.create('books', { title, price: '2.00' });
+      proxy.dropNext = (req) => req.method === 'POST';
+      const r1 = await p.sync();
+      assert(r1.uncertain && p.pending()[0].uncertain, 'incierta');
+      assert(errors.some((e) => /no se sabe si el create/.test(e.error.message)), 'evento error');
+      proxy.requests.length = 0;
+      const r2 = await p.sync();
+      eq([r2.pending, proxy.requests.filter((x) => x.startsWith('POST')).length], [1, 0], 'no la repite sola');
+      const r3 = await p.sync({ retryUncertain: true });
+      eq([r3.pushed, r3.pending], [1, 0], 'la repite si se pide');
+      eq((await serverItems('books')).filter((b) => b.title === title).length, 2, 'y entonces hay dos: por eso no lo hace sola');
+    } finally { await p.close(); }
+  });
+
+  await check('discard(): quita un create incierto y deshace el cambio local', async () => {
+    proxy.rewrite = onRoot((d) => { d.profiles = d.profiles.filter((x) => x !== 'writes'); });
+    const p = await openRestepSync({ url: API, collections: ['books'], interval: 0, autoPush: false });
+    proxy.rewrite = null;
+    try {
+      const item = await p.create('books', { title: 'Descartado', price: '2.00' });
+      proxy.dropNext = (req) => req.method === 'POST';
+      await p.sync();
+      const [op] = p.pending();
+      eq(await p.discard(op.opId), true, 'descartada');
+      eq([p.pending().length, p.get('books', item.id)], [0, null], 'sin cola y sin el provisional');
+    } finally { await p.close(); }
+  });
+
+  await check('credenciales solo al origen de la API y enlaces con otro esquema (§3, §4.3)', async () => {
+    proxy.rewrite = (req, status, body) => (req.method === 'GET' && req.url.startsWith('/books?limit=') && status === 200
+      ? { ...body, next: `http://localhost:${OTHER_PORT}/books?cursor=ajeno` } : undefined);
+    const p = await openRestepSync({ url: API, collections: ['books'], interval: 0, autoPush: false, token: 'secreto', headers: { 'x-tenant': 'uno' } });
+    try {
+      other.seen.length = 0;
+      await p.sync();
+      eq(other.seen.length, 1, 'ha seguido next al otro origen');
+      eq([other.seen[0].authorization, other.seen[0]['x-tenant']], [undefined, undefined], 'sin token ni cabeceras extra');
+      proxy.rewrite = (req, status, body) => (req.method === 'GET' && req.url.startsWith('/books?limit=') && status === 200
+        ? { ...body, next: 'file:///etc/passwd' } : undefined);
+      const fresh = await openRestepSync({ url: API, collections: ['books'], interval: 0, autoPush: false });
+      const r = await fresh.sync();
+      await fresh.close();
+      assert(r.errors.some((e) => /esquema/.test(e.message)), `error por el esquema: ${r.errors.map((e) => e.message).join('; ')}`);
+    } finally { proxy.rewrite = null; await p.close(); }
+  });
+
+  await check('colaciones (§6.1): no ordena ni filtra en local por un campo con la del servidor', async () => {
+    let msg = '';
+    try { db.list('categories', { sort: 'name' }); } catch (e) { msg = e.message; }
+    assert(msg.includes('colación del servidor'), `ordenar: ${msg}`);
+    msg = '';
+    try { db.list('categories', { filter: { name: 'Libros' } }); } catch (e) { msg = e.message; }
+    assert(msg.includes('colación del servidor'), `filtrar: ${msg}`);
+    eq(db.list('categories', { sort: (a, b) => a.id.localeCompare(b.id) }).length > 0, true, 'con una función sí');
+    const titles = db.list('books', { sort: 'title' }).map((b) => b.title);
+    const byCodepoint = [...titles].sort((a, b) => { const x = [...a], y = [...b]; for (let i = 0; i < Math.min(x.length, y.length); i++) { const d = x[i].codePointAt(0) - y[i].codePointAt(0); if (d) return d; } return x.length - y.length; });
+    eq(titles, byCodepoint, 'los textos se ordenan por puntos de código');
+  });
+
   await check('errores claros al abrir', async () => {
     let msg = '';
     try { await openRestepSync({ url: API, collections: ['nada'], interval: 0 }); } catch (e) { msg = e.message; }
@@ -300,6 +538,7 @@ try {
   await db?.close();
   await stopServer();
   proxyServer.close();
+  otherServer.close();
   await rm(dir, { recursive: true, force: true });
 }
 

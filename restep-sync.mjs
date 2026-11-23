@@ -1,5 +1,5 @@
-// restep-sync · cliente offline-first para APIs Restep 1 (https://restep.wubytes.com/1/).
-// Mantiene una réplica local de una o varias colecciones al día con el perfil sync (§9) y guarda las
+// restep-sync · cliente offline-first para APIs Restep 1 (https://restep.wubytes.com/1/, borrador 6).
+// Mantiene una réplica local de una o varias colecciones al día con el perfil sync (§10) y guarda las
 // escrituras en una cola que se envía cuando hay conexión, con las garantías de writes (§7):
 // Idempotency-Key estable en cada create e If-Match en cada update y delete.
 // Sin dependencias. Funciona en Node 18+ y en el navegador (fileStorage solo en Node; indexedDBStorage
@@ -18,10 +18,18 @@
 // tienen que quitar la operación de la cola para deshacer el cambio optimista.
 
 const VERSION = 1; // del formato guardado en el almacén
+// §1.2: sync es experimental, así que solo se usa con una API que declare una versión cuyo texto de
+// sync implementa este cliente; con cualquier otra, las colecciones se recargan enteras.
+export const KNOWN_TEXTS = ['1.0-draft.6'];
+// §1.1: la gramática de restep, sin ceros a la izquierda.
+const RESTEP_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(draft|rc)\.(0|[1-9]\d*))?$/;
 const TRANSIENT = new Set([408, 425, 429, 500, 502, 503, 504]);
-// 409 es «la misma petición sigue en curso» (§7.1) o un conflicto del dominio, y el código no lo
-// distingue: en un create se reintenta unas pocas veces, y luego se da por permanente.
-const MAX_409_RETRIES = 5;
+// §5.7: 429 y 503 (y 425, que el servidor da sin procesar) solo llegan a peticiones sin efecto; los
+// demás no dicen nada del efecto, así que un create solo se repite si es seguro repetirlo.
+const NO_EFFECT = new Set([425, 429, 503]);
+// Un 409 solo se reintenta con code request_in_progress (la misma petición sigue en curso, §7.1),
+// respetando Retry-After; cualquier otro 409 (conflict: un duplicado, una transición imposible) es permanente.
+const IN_PROGRESS = 'request_in_progress';
 const MAX_CONFLICT_ROUNDS = 3;
 
 // ── Almacenes ─────────────────────────────────────────────────────────────────
@@ -96,7 +104,29 @@ const canonical = (v) => (Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : isObject(v) ? `{${Object.keys(v).filter((k) => k !== '_etag').sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v));
 const sameData = (a, b) => canonical(a) === canonical(b);
+function codepoints(a, b) { // §6.1: por puntos de código, no por unidades UTF-16 ni por idioma
+  const x = [...a], y = [...b];
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    const d = x[i].codePointAt(0) - y[i].codePointAt(0);
+    if (d) return d;
+  }
+  return x.length - y.length;
+}
+function linkTargets(header, rel) {
+  const out = [];
+  for (const m of (header ?? '').matchAll(/<([^>]*)>([^,<]*)/g)) {
+    const rels = m[2].match(/rel\s*=\s*("([^"]*)"|[^;\s]+)/i);
+    if (rels && (rels[2] ?? rels[1]).split(/\s+/).includes(rel)) out.push(m[1]);
+  }
+  return out;
+}
 const clone = (v) => (v === undefined ? undefined : structuredClone(v));
+// Lo que se guarda de un elemento: sus datos sin _etag (que no es del elemento, §7.2) y su ETag, la del
+// _etag que trae el listado o, si falta, la que se conozca por otra vía.
+function entry(data, etag = null) {
+  const { _etag, ...rest } = data;
+  return { data: rest, etag: typeof _etag === 'string' ? _etag : etag };
+}
 
 let nodeCrypto;
 async function uuid() {
@@ -161,25 +191,35 @@ class RestepSync {
     this.data = saved?.version === VERSION && saved.root === this.root.href ? saved
       : { version: VERSION, root: this.root.href, discovery: null, collections: {}, queue: [], aliases: {} };
     try {
-      const r = await this._request('GET', '');
-      if (TRANSIENT.has(r.status) && this.data.discovery) throw new NetworkError(`${r.status}`);
-      if (r.status !== 200) throw new RestepError(r.status, r.body, `restep-sync: el descubrimiento respondió ${r.status}.`);
-      this.data.discovery = r.body;
+      this.data.discovery = await this._discover();
     } catch (e) {
       if (!(e instanceof NetworkError)) throw e;
       if (!this.data.discovery) throw new Error(`restep-sync: sin conexión con ${this.root.href} y sin copia local del descubrimiento.`);
     }
     const d = this.data.discovery;
-    const sync = (d.profiles ?? []).includes('sync');
+    // §4.2: sin documento de descubrimiento, solo core; las colecciones están en /<nombre>.
+    const core = d.restep === undefined;
+    const profiles = core ? ['core'] : d.profiles ?? [];
+    const knownText = KNOWN_TEXTS.includes(d.restep);
+    this.writes = profiles.includes('writes');
+    this.anonymousRefused = !core && isObject(d.idempotency) && d.idempotency.anonymous === false;
     for (const name of this.names) {
-      const c = d.collections?.[name];
-      if (!c) throw new Error(`restep-sync: la API no declara la colección ${name}.`);
-      if (sync && !c.filter?.id?.ops?.includes('in'))
-        throw new Error(`restep-sync: ${name} no declara filter id con in, que sync necesita (§9).`);
+      const c = core ? { path: `/${name}` } : d.collections?.[name];
+      if (!isObject(c)) throw new Error(`restep-sync: la API no declara la colección ${name}.`);
+      const path = typeof c.path === 'string' ? c.path : `/${name}`;
+      if (/[{}]/.test(path)) throw new Error(`restep-sync: ${name} es una subcolección (${path}); este cliente solo replica colecciones sin plantilla.`);
+      // §10: una colección está sincronizada si declara sync con el perfil anunciado; solo entonces responde :changes.
+      const synced = profiles.includes('sync') && isObject(c.sync);
+      if (synced && knownText && !c.filter?.id?.ops?.includes('in'))
+        throw new Error(`restep-sync: ${name} declara sync pero no filter id con in, que sync necesita (§10).`);
       const local = this.data.collections[name] ??= { state: null, items: {} };
-      local.path = c.path ?? `/${name}`;
-      local.mode = sync ? 'sync' : 'reload'; // sin sync, cada sincronización recarga la colección entera
-      local.maxLimit = c.max_limit ?? null;
+      local.path = path;
+      // Sin sync (o con un texto de sync que este cliente no conoce, §1.2), cada sincronización recarga la colección entera.
+      local.mode = synced && knownText ? 'sync' : 'reload';
+      local.why = local.mode === 'sync' ? null : !synced ? 'no declara sync' : `el texto de sync de ${d.restep} no es uno que este cliente implemente`;
+      local.maxLimit = Number.isInteger(c.max_limit) ? c.max_limit : null;
+      local.idFrom = c.id_from ?? 'server';
+      local.collations = isObject(c.collations) ? c.collations : {};
     }
     await this._save();
     if (this.interval > 0) {
@@ -188,6 +228,33 @@ class RestepSync {
     }
     if (this.autoPush && this.data.queue.length) this._kick();
   }
+
+  // GET a la raíz; si no es un documento de descubrimiento, el primer service-desc que lo sea (§4.2).
+  // Devuelve el documento, o {} si no hay ninguno (solo core).
+  async _discover() {
+    const r = await this._request('GET', '');
+    if (TRANSIENT.has(r.status) && this.data.discovery) throw new NetworkError(`${r.status}`);
+    const isDiscovery = (x) => x.status >= 200 && x.status < 300 && isObject(x.body) && typeof x.body.restep === 'string';
+    let doc = isDiscovery(r) ? r.body : null;
+    if (!doc) {
+      for (const target of linkTargets(r.headers.get('link'), 'service-desc')) {
+        const t = await this._request('GET', new URL(target, r.url).href).catch((e) => { if (e instanceof NetworkError) throw e; return null; });
+        if (t && isDiscovery(t)) { doc = t.body; break; }
+      }
+    }
+    if (doc) {
+      // §1.1: un restep que no sigue la gramática, o de otra versión mayor, no es un documento de Restep 1,
+      // y con él tampoco se puede suponer solo core.
+      const v = RESTEP_VERSION.exec(doc.restep);
+      if (!v || v[1] !== '1') throw new Error(`restep-sync: la API declara "restep": ${JSON.stringify(doc.restep)}, que no es Restep 1 (§1.1).`);
+      return doc;
+    }
+    if (r.status === 401 || r.status === 403 || r.status >= 500) throw new RestepError(r.status, r.body, `restep-sync: la raíz de la API respondió ${r.status}.`);
+    return {}; // §4.2: sin documento, solo core
+  }
+
+  // 'sync' o 'reload': cómo se trae cada colección.
+  mode(name) { return this._coll(name).mode; }
 
   close() {
     this.closed = true;
@@ -235,18 +302,29 @@ class RestepSync {
 
   // filter: objeto de igualdades ({ category: 'poesia' }) o función. sort: 'campo', '-campo', lista
   // de ellos o función de comparación. limit y offset recortan el resultado.
+  // Los textos se ordenan por puntos de código (§6.1). Un campo con otra colación ("server" o una que
+  // no se conoce) no se ordena ni se compara en local: §6.1 prohíbe reproducir esa igualdad o ese orden.
   list(name, { filter, sort, limit, offset = 0 } = {}) {
     let items = [...this._view(name).values()];
+    const collations = this._coll(name).collations ?? {};
+    const local = (k, what) => {
+      if (collations[k] !== undefined && collations[k] !== 'codepoint')
+        throw new Error(`restep-sync: ${name}.${k} se compara con la colación del servidor (${JSON.stringify(collations[k])}): no se puede ${what} en local (§6.1); pasa una función.`);
+    };
     if (typeof filter === 'function') items = items.filter(filter);
-    else if (isObject(filter)) items = items.filter((it) => Object.entries(filter).every(([k, v]) => sameData(it[k], v)));
+    else if (isObject(filter)) {
+      for (const [k, v] of Object.entries(filter)) if (typeof v === 'string') local(k, 'filtrar por él');
+      items = items.filter((it) => Object.entries(filter).every(([k, v]) => sameData(it[k], v)));
+    }
     if (typeof sort === 'function') items.sort(sort);
     else if (sort) {
       const keys = (Array.isArray(sort) ? sort : String(sort).split(',')).map((s) => [s.replace(/^-/, ''), s.startsWith('-') ? -1 : 1]);
+      for (const [k] of keys) local(k, 'ordenar por él');
       items.sort((a, b) => {
         for (const [k, dir] of keys) {
           const x = a[k], y = b[k];
           if (x == null || y == null) { if (x == null && y == null) continue; return x == null ? 1 : -1; }
-          const d = typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y));
+          const d = typeof x === 'number' && typeof y === 'number' ? x - y : codepoints(String(x), String(y));
           if (d) return d * dir;
         }
         return 0;
@@ -256,16 +334,26 @@ class RestepSync {
   }
   get(name, id) { return clone(this._view(name).get(this.resolveId(name, id))) ?? null; }
   pending() {
-    return this.data.queue.map(({ opId, type, collection, id, body, patch, attempts, lastError, nextAt, retryAt }) =>
-      clone({ opId, type, collection, id, body, patch, attempts, lastError, nextAt, retryAt }));
+    return this.data.queue.map(({ opId, type, collection, id, body, patch, attempts, lastError, nextAt, retryAt, uncertain }) =>
+      clone({ opId, type, collection, id, body, patch, attempts, lastError, nextAt, retryAt, ...(uncertain && { uncertain }) }));
   }
 
   // ── Escritura optimista ──
+  // §5.1: con id_from "client", el id lo elige el cliente (un UUID v4, o el id del cuerpo); con "either"
+  // solo si el cuerpo lo trae; con "server", sin declarar o un valor que no se conoce, nunca se envía.
   async create(name, body) {
-    this._coll(name);
+    const c = this._coll(name);
     if (!isObject(body)) throw new Error('restep-sync: create necesita un objeto.');
-    const id = `local-${await uuid()}`;
-    const op = { opId: await uuid(), type: 'create', collection: name, id, body: clone(body), key: await uuid(), attempts: 0 };
+    const { id: chosen, ...rest } = body;
+    const own = c.idFrom === 'client' || c.idFrom === 'either';
+    if (chosen !== undefined && !own) throw new Error(`restep-sync: ${name} no deja elegir el id (id_from ${JSON.stringify(c.idFrom)}, §5.1).`);
+    if (chosen !== undefined && (typeof chosen !== 'string' || !/^[A-Za-z0-9._~-]+$/.test(chosen) || chosen === '.' || chosen === '..'))
+      throw new Error(`restep-sync: ${JSON.stringify(chosen)} no es un id válido (§3).`);
+    if (chosen !== undefined && this._view(name).has(chosen)) throw new Error(`restep-sync: ya hay un ${name} ${chosen}.`);
+    const clientId = chosen ?? (c.idFrom === 'client' ? await uuid() : null);
+    const id = clientId ?? `local-${await uuid()}`;
+    const op = { opId: await uuid(), type: 'create', collection: name, id, body: clone(rest), key: await uuid(), attempts: 0,
+      ...(clientId && { clientId: true }) };
     return this._enqueue(op, { created: [id] }, id);
   }
   async update(name, id, patch, { onConflict } = {}) {
@@ -313,9 +401,15 @@ class RestepSync {
   // ── HTTP ──
   async _request(method, path, { body, headers = {}, json } = {}) {
     // Las rutas son relativas a la raíz de la API (§2); './' evita que «books:changes» se lea como esquema.
+    // Un enlace (next, Location) llega ya resuelto como URL absoluta.
     const url = /^[a-z][a-z0-9+.-]*:/i.test(path) ? new URL(path) : new URL(`./${path.replace(/^\//, '')}`, this.root);
-    const h = { accept: 'application/json', ...this.extraHeaders, ...headers };
-    const token = typeof this.token === 'function' ? await this.token() : this.token;
+    // §3: no se sigue un enlace con otro esquema que https o el de la raíz.
+    if (url.protocol !== 'https:' && url.protocol !== this.root.protocol)
+      throw new RestepError(0, null, `restep-sync: no se sigue ${url.href}: su esquema no es https ni el de la API (§3).`);
+    // §4.3: las credenciales de la API (el token y las cabeceras extra) solo van a su origen.
+    const mine = url.origin === this.root.origin;
+    const h = { accept: 'application/json', ...(mine && this.extraHeaders), ...headers };
+    const token = mine && (typeof this.token === 'function' ? await this.token() : this.token);
     if (token) h.authorization = `Bearer ${token}`;
     if (body !== undefined) h['content-type'] ??= json ?? 'application/json';
     let res, text;
@@ -336,17 +430,18 @@ class RestepSync {
   // esta empieza cuando termine. Sin conexión no lanza: devuelve el informe con online: false.
   // background: true respeta la espera entre reintentos; bajo demanda se reintenta ya, salvo lo que el
   // servidor haya pedido con Retry-After. pull: false solo envía la cola.
-  sync({ background = false, pull = true } = {}) {
-    const run = this.chain.then(() => this._syncOnce({ background, pull }));
+  // retryUncertain: true vuelve a enviar un create cuyo resultado no se sabe y que no es seguro repetir.
+  sync({ background = false, pull = true, retryUncertain = false } = {}) {
+    const run = this.chain.then(() => this._syncOnce({ background, pull, retryUncertain }));
     this.chain = run.catch(() => {});
     return run;
   }
 
-  async _syncOnce({ background, pull }) {
+  async _syncOnce({ background, pull, retryUncertain }) {
     const report = { online: true, pushed: 0, dropped: 0, conflicts: 0, pending: 0, pulled: {}, reset: [], errors: [] };
     if (this.closed) return { ...report, pending: this.data.queue.length };
     try {
-      await this._push(report, { force: !background });
+      await this._push(report, { force: !background, retryUncertain });
       if (pull && report.online) {
         if (Date.now() < this.holdUntil) report.waitingUntil = this.holdUntil;
         else for (const name of this.names) await this._pull(name, report);
@@ -361,24 +456,53 @@ class RestepSync {
   }
 
   // ── Envío de la cola ──
-  async _push(report, { force }) {
+  async _push(report, { force, retryUncertain }) {
     while (this.data.queue.length && !this.closed) {
       const op = this.data.queue[0];
       const now = Date.now();
+      if (op.uncertain && !retryUncertain) { report.uncertain = op.opId; return; } // la cola espera a que se decida
       if (op.retryAt > now) { report.waitingUntil = op.retryAt; return; } // lo pidió el servidor
       if (!force && op.nextAt > now) { report.waitingUntil = op.nextAt; return; }
+      delete op.uncertain;
       let result;
       try {
         result = await this._send(op, report);
       } catch (e) {
         if (!(e instanceof NetworkError)) throw e;
         this._schedule(op, null, e.message);
+        if (op.type === 'create' && !this._repeatable(op)) this._uncertain(op, report, e.message);
         await this._save();
         report.online = false;
         return;
       }
       if (result === 'retry') { report.waitingUntil = op.retryAt ?? op.nextAt; return; }
     }
+  }
+
+  // §5.7: un POST que no se sabe si tuvo efecto solo se repite solo si lleva Idempotency-Key y la API
+  // anuncia writes, o si crea con un id elegido por el cliente, que no se puede crear dos veces.
+  _keys() { return this.writes && !(this.anonymousRefused && !this._credentials()); }
+  _credentials() {
+    const names = Object.keys(this.extraHeaders).map((k) => k.toLowerCase());
+    return !!this.token || names.includes('authorization') || names.includes('cookie');
+  }
+  _repeatable(op) { return !!op.clientId || this._keys(); }
+  _uncertain(op, report, message) {
+    op.uncertain = true;
+    report.uncertain = op.opId;
+    const error = new RestepError(0, null, `restep-sync: no se sabe si el create de ${op.collection} ${op.id} llegó (${message}) y repetirlo podría duplicarlo; usa sync({ retryUncertain: true }) o discard().`);
+    report.errors.push(error);
+    this._emit('error', { error, operation: clone(op) });
+  }
+  // Quita de la cola una operación (por ejemplo un create incierto) y deshace su cambio local.
+  async discard(opId) {
+    const op = this.data.queue.find((o) => o.opId === opId);
+    if (!op) return false;
+    this._drop(op, true);
+    await this._save();
+    this._emit('change', { collection: op.collection, source: 'rollback', created: [],
+      updated: op.type === 'create' ? [] : [op.id], destroyed: op.type === 'create' ? [op.id] : [] });
+    return true;
   }
 
   _schedule(op, res, message) {
@@ -394,8 +518,16 @@ class RestepSync {
     for (let round = 0; ; round++) {
       const res = op.type === 'create' ? await this._sendCreate(op, c) : await this._sendChange(op, c);
       if (res.status >= 200 && res.status < 300) return this._confirm(op, c, res, report);
-      if (TRANSIENT.has(res.status) || (res.status === 409 && op.type === 'create' && (op.attempts ?? 0) < MAX_409_RETRIES)) {
+      // §5.1: un create con id propio que se repite tras perder la respuesta da 409 taken; se lee el
+      // elemento para saber si el primer intento llegó.
+      if (op.type === 'create' && op.clientId && op.attempts > 0 && res.status === 409
+        && (res.body?.errors ?? []).some((e) => e?.pointer === '/id' && e?.code === 'taken')) {
+        const read = await this._read(c, op.id);
+        if (read) return this._confirm(op, c, { status: 200, body: { ...read.data, _etag: read.etag }, headers: new Headers(read.etag ? { etag: read.etag } : {}) }, report);
+      }
+      if (TRANSIENT.has(res.status) || (res.status === 409 && res.body?.code === IN_PROGRESS)) {
         this._schedule(op, res, `${res.status} ${res.body?.code ?? ''}`.trim());
+        if (op.type === 'create' && !NO_EFFECT.has(res.status) && !this._repeatable(op)) this._uncertain(op, report, `${res.status}`);
         await this._save();
         return 'retry';
       }
@@ -424,12 +556,13 @@ class RestepSync {
   }
 
   _sendCreate(op, c) {
-    return this._request('POST', c.path, { body: op.body, headers: { 'idempotency-key': `"${op.key}"` } });
+    const body = op.clientId ? { ...op.body, id: op.id } : op.body;
+    return this._request('POST', c.path, { body, headers: this._keys() ? { 'idempotency-key': `"${op.key}"` } : {} });
   }
 
-  // update y delete con If-Match. Si no se conoce la ETag de la versión de partida (la colección no
-  // trae _etag), se lee el elemento: si sigue igual que la versión que vio el usuario, se usa su ETag;
-  // si no, es un conflicto, sin llegar a escribir.
+  // update y delete con If-Match. La ETag de la versión de partida es el _etag que trajo el listado
+  // (§7.2). Solo si falta (un servidor que no lo pone), se lee el elemento: si sigue igual que la
+  // versión que vio el usuario, se usa su ETag; si no, es un conflicto, sin llegar a escribir.
   async _sendChange(op, c) {
     op.base ??= clone(c.items[op.id] ?? null);
     if (!op.base) return { status: 404 };
@@ -450,7 +583,8 @@ class RestepSync {
     const r = await this._request('GET', `${c.path}/${encodeURIComponent(id)}`);
     if (r.status === 404 || r.status === 410) return null;
     if (r.status !== 200) throw new RestepError(r.status, r.body);
-    return { data: r.body, etag: r.headers.get('etag') ?? r.body?._etag ?? null };
+    const { _etag, ...data } = r.body ?? {};
+    return { data, etag: r.headers.get('etag') ?? _etag ?? null };
   }
 
   async _confirm(op, c, res, report) {
@@ -467,20 +601,22 @@ class RestepSync {
       if (op.type === 'create') {
         if (!isObject(data)) { // Prefer: return=minimal o un servidor que no devuelve el cuerpo
           const loc = res.headers.get('location');
-          id = loc ? decodeURIComponent(loc.split('/').pop()) : null;
+          id = loc ? decodeURIComponent(new URL(loc, res.url ?? this.root).pathname.split('/').pop()) : null;
           const read = id && await this._read(c, id);
           if (read) ({ data, etag } = read);
         }
         id = data?.id ?? id;
-        this.data.aliases[`${op.collection}/${op.id}`] = id;
-        for (const o of q) if (o.collection === op.collection && o.id === op.id) o.id = id;
-        change.replaced = { [op.id]: id };
+        if (id !== op.id) { // un id elegido por el cliente ya es el definitivo
+          this.data.aliases[`${op.collection}/${op.id}`] = id;
+          for (const o of q) if (o.collection === op.collection && o.id === op.id) o.id = id;
+          change.replaced = { [op.id]: id };
+        }
         change.created.push(id);
       } else {
         if (!isObject(data)) { const read = await this._read(c, id); if (read) ({ data, etag } = read); }
         change.updated.push(id);
       }
-      if (isObject(data)) c.items[id] = { data, etag: data._etag ?? etag };
+      if (isObject(data)) c.items[id] = entry(data, etag);
     }
     // La siguiente operación sobre el mismo elemento parte de la versión que acaba de confirmarse.
     const next = q.find((o) => o.collection === op.collection && o.id === id);
@@ -539,13 +675,17 @@ class RestepSync {
     this._changed();
   }
 
-  // ── Recepción de cambios (§9) ──
+  // ── Recepción de cambios (§10) ──
   async _pull(name, report) {
     const c = this._coll(name);
     if (c.mode === 'reload' || !c.state) return this._reload(name, report);
     for (;;) {
       const r = await this._request('GET', `${c.path}:changes?since=${encodeURIComponent(c.state)}`);
-      if (r.status === 410) { report.reset.push(name); return this._reload(name, report); }
+      // 410: el servidor ya no puede calcular los cambios. Un since que no reconoce (otro arranque, otra
+      // versión) se trata igual: se recarga la colección.
+      if (r.status === 410 || (r.status === 400 && r.body?.code === 'invalid_parameter' && r.body?.parameter === 'since')) {
+        report.reset.push(name); return this._reload(name, report);
+      }
       this._check(r);
       const { created = [], updated = [], destroyed = [], state, has_more } = r.body ?? {};
       if (typeof state !== 'string') throw new RestepError(r.status, null, `restep-sync: ${name}:changes no devuelve state.`);
@@ -557,11 +697,11 @@ class RestepSync {
           const data = fetched.get(id);
           const old = c.items[id];
           (old ? change.updated : change.created).push(id);
-          c.items[id] = { data, etag: data._etag ?? (old && sameData(old.data, data) ? old.etag : null) };
+          c.items[id] = entry(data, old && sameData(old.data, data) ? old.etag : null);
         } else if (c.items[id]) { delete c.items[id]; change.destroyed.push(id); } // ya no se ve
       }
       for (const id of destroyed) if (c.items[id]) { delete c.items[id]; change.destroyed.push(id); }
-      c.state = state; // solo después de aplicar los cambios (§9)
+      c.state = state; // solo después de aplicar los cambios (§10)
       this._changed();
       await this._save();
       const pulled = report.pulled[name] ??= { created: 0, updated: 0, destroyed: 0 };
@@ -577,19 +717,21 @@ class RestepSync {
     throw new RestepError(r.status, r.body);
   }
 
-  // Pide los elementos por id con filter[id][in] (§9), en trozos que caben en una página.
+  // Pide los elementos por id con filter[id][in] (§10), en trozos que caben en una página. limit solo
+  // con max_limit declarado (§6.4); URLSearchParams escribe un + literal como %2B (§5.2).
   async _fetchIds(c, ids) {
     const out = new Map();
     const size = Math.min(c.maxLimit ?? 50, 50);
     for (let i = 0; i < ids.length; i += size) {
       const chunk = ids.slice(i, i + size);
-      const q = new URLSearchParams({ 'filter[id][in]': chunk.join(','), limit: String(chunk.length) });
+      const q = new URLSearchParams({ 'filter[id][in]': chunk.join(','), ...(c.maxLimit && { limit: String(chunk.length) }) });
       for (const it of await this._walk(`${c.path}?${q}`)) out.set(it.id, it);
     }
     return out;
   }
 
-  // Sigue next hasta null (§5.2). Devuelve los elementos y el state de la primera página.
+  // Sigue next hasta null (§5.2), tal cual: es una ruta absoluta o una URL, que se resuelve contra la
+  // de la petición (§3). Devuelve los elementos y el state de la primera página.
   async _walk(first, onFirst) {
     const items = [];
     for (let next = first, page = 0; next; page++) {
@@ -598,7 +740,7 @@ class RestepSync {
       if (!Array.isArray(r.body?.items)) throw new RestepError(r.status, null, `restep-sync: ${next} no es una colección.`);
       if (page === 0) onFirst?.(r.body);
       items.push(...r.body.items);
-      next = r.body.next;
+      next = typeof r.body.next === 'string' ? new URL(r.body.next, r.url).href : null;
     }
     return items;
   }
@@ -609,13 +751,13 @@ class RestepSync {
     const q = c.maxLimit ? `?limit=${c.maxLimit}` : '';
     const items = await this._walk(`${c.path}${q}`, (b) => { state = b.state ?? null; });
     if (c.mode === 'sync' && typeof state !== 'string')
-      throw new RestepError(200, null, `restep-sync: ${name} no devuelve state aunque la API anuncia sync.`);
+      throw new RestepError(200, null, `restep-sync: ${name} no devuelve state aunque declara sync (§10).`);
     const before = c.items;
     c.items = {};
     const change = { collection: name, source: 'remote', reload: true, created: [], updated: [], destroyed: [] };
     for (const data of items) {
       const old = before[data.id];
-      c.items[data.id] = { data, etag: data._etag ?? (old && sameData(old.data, data) ? old.etag : null) };
+      c.items[data.id] = entry(data, old && sameData(old.data, data) ? old.etag : null);
       if (!old) change.created.push(data.id);
       else if (!sameData(before[data.id].data, data)) change.updated.push(data.id);
     }

@@ -1,6 +1,6 @@
 {
   "name": "restep-sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cliente offline-first para APIs Restep 1: réplica local con el perfil sync y cola de escrituras",
   "type": "module",
   "main": "restep-sync.mjs",
