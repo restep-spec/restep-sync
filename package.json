@@ -8,6 +8,10 @@
     ".": "./restep-sync.mjs"
   },
   "license": "MIT",
+  "files": [
+    "restep-sync.mjs",
+    "README.md"
+  ],
   "engines": {
     "node": ">=18"
   },
