@@ -1,12 +1,12 @@
 # restep-sync (prototype)
 
-Offline-first client library for [Restep 1](https://restep.wubytes.com/1/) APIs
-(draft 6): it keeps a local replica of one or more collections up to date with the `sync` profile
+Offline-first client library for [Restep 1](https://w3id.org/restep/1/) APIs
+(draft 7): it keeps a local replica of one or more collections up to date with the `sync` profile
 (§10) and stores writes in a queue that is sent when there is a connection, with the guarantees of
 `writes` (§7). A single module, Node 18+ or browser, no dependencies.
 
-`sync` is experimental in draft 6 (§1.2): this client only uses it with an API that declares
-`"restep": "1.0-draft.6"`, the only `sync` text it implements (`KNOWN_TEXTS`). With any other
+`sync` is experimental in draft 7 (§1.2): this client only uses it with an API that declares
+`"restep": "1.0-draft.7"`, the only `sync` text it implements (`KNOWN_TEXTS`). With any other
 version of Restep 1 it reloads whole collections.
 
 ```bash
@@ -60,10 +60,42 @@ node tools/restep-sync/ref-sync-server.mjs     # copy of the reference server wi
 | `autoPush` | `true` | After each local write, tries to send the queue right away |
 | `onConflict` | `'server'` | `'server'`, `'client'` or a function (see "Conflicts") |
 | `token` | — | String or function (async too) that gives the token for `Authorization: Bearer` |
-| `headers` | `{}` | Extra headers on every request (for example `Accept-Language`) |
+| `language` | `null` | `Accept-Language` of every request: the language of the copy (§10). `null` gets the API's default language |
+| `headers` | `{}` | Extra headers on every request, only to the API's origin |
 | `retry` | `{ base: 1000, max: 60000 }` | Exponential backoff between retries, in ms, with some jitter |
 | `timeout` | `15000` | Maximum time per request, in ms |
 | `fetch` | `globalThis.fetch` | To inject another implementation |
+
+## What draft 7 changes
+
+- **Default filters off** (§5.2, §6.1, §10): the traversal and the reload of changed items by id
+  send `filter[name]=false` for every named filter declared `"default": true`, so the copy has
+  every item the client can see, archived ones included.
+- **What cannot be copied** (§4.3, §6.1): a collection whose `methods` leave out `GET`, or with a
+  required filter (in `filter` or `named_filters`), gives an error on open.
+- **One language per copy** (§10): `language` goes in `Accept-Language`, and is stored with each
+  collection. `setLanguage(tag)`, or opening a stored copy with another `language`, makes the next
+  sync traverse each collection again before treating it as current.
+- **Localized fields** (§3, §5.1): sent as given; the server decides (a write may carry the value
+  the item would have).
+- **Retries with the key only within `idempotency.ttl`** (§5.7, 24 hours where it is not
+  declared): past it, a `create` whose outcome is unknown becomes uncertain, as one without a key
+  is (§5.7: it stays uncertain unless the application establishes the outcome another way, such
+  as a filter by a unique field or the `created` of a later sync). `sync({ retryUncertain: true })`
+  then sends it with a new key.
+- **Replays** (§7.1): a replayed response (`Idempotent-Replayed: true`) without `ETag`, `_etag`
+  or `Content-Location` may carry a stored body that is no longer the item's current
+  representation, so it is not taken as the new copy: the item is read. A replayed `201` without a
+  body carries no `ETag` (§7.3, council round 3, decision 5): the item is read at `Location`, and
+  that read gives the copy and its ETag. Filter operands are only the `id`s of `filter[id][in]`,
+  so the number grammar of §6.1 does not apply.
+- **An `id` of `created` or `updated` that the reload does not return** (§10) is removed from the
+  copy (reported in `destroyed`), and the next `:changes` starts from the `state` it gave.
+- **`reusable_ids`** (§5.1, §10): an `id` in `created` is a new item (reported in `created`), a
+  client-chosen `id` there is no protection against duplicates, and a stored ETag is never reused
+  for an item read again.
+- **Discovery** (§4.2): only a `2xx` without `restep`, or a `404`, means `core` only; any other
+  error (`400`, `405`…) is an error on open.
 
 ## How it works
 
@@ -91,6 +123,9 @@ node tools/restep-sync/ref-sync-server.mjs     # copy of the reference server wi
   the server no longer recognises), triggers a reload of the collection (the write queue is
   kept).
 - **Sending the queue.** Before pulling changes, in order:
+  - A collection with `upload` and without `schemas.create` takes only files (§5.1), which this
+    client does not send: `create()` refuses it before queuing (a JSON `POST` there would be no
+    creation, and where `media_types` admit `application/json` it would be stored as a file).
   - `create`: `POST` with `Content-Type: application/json` and an `Idempotency-Key` generated
     when queuing and stored with the operation, so retries (also after restarting the app) do not
     duplicate. The key is only sent if the API announces `writes`, and not without credentials
@@ -180,7 +215,10 @@ operations, those use the general strategy.
 node tools/restep-sync/test.mjs      # from restep/
 ```
 
-The reference server (`vendor/restep-server.mjs`, draft 6) **does not implement
+Before the server starts, a block of tests runs against an API simulated through the `fetch`
+option: the draft 7 items above.
+
+The reference server (`vendor/restep-server.mjs`) **does not implement
 `sync`**, so `ref-sync-server.mjs` generates a copy in a temporary directory with a few text
 patches (failing loudly if any no longer applies) that add: `sync` in `profiles` and
 `sync.retention` only on `books` and `categories` (variable `SYNCED`); `_etag` on each item of a
@@ -244,13 +282,13 @@ retried it a few times on a `create`. Since draft 5 that case is `409 request_in
 1. **ETag of synced items.** Settled in draft 5: in a collection that answers `:changes`, every
    item that accepts `PATCH` or `DELETE` carries its `_etag` on every page (§7.2).
 2. **Ids with commas.** `filter[id][in]=a,b` does not define how to escape a comma inside an id,
-   so a collection with such ids cannot be synced. In draft 6 an `id` only contains unreserved
+   so a collection with such ids cannot be synced. Since draft 6 an `id` only contains unreserved
    characters (§3), so it can no longer contain commas: settled.
-3. **An id from `created`/`updated` that does not come back when requested.** It may have been
-   deleted between `:changes` and the request, or have stopped being visible. This client removes
-   it from the copy and does nothing more; the spec does not say what to do, although the next
-   `:changes` should bring it in `destroyed`.
-4. **`state` of a filtered response.** Settled in draft 6: a filtered response carries the same
+3. **An id from `created`/`updated` that does not come back when requested.** Settled in draft 7
+   (§10): the client removes it from its copy and goes on from the `state` of `:changes`; if the
+   item comes back, a later call reports it. This client does so.
+4. **`state` of a filtered response.** Settled in draft 6, and in draft 7 a copy turns off the
+   default filters: a filtered response carries the same
    `state` as the whole collection (§10). This client still only uses the one from `:changes` or
    from a full load.
 5. **Ambiguous `409`.** Settled in draft 5: the same request still in progress gives `409
@@ -259,11 +297,11 @@ retried it a few times on a `create`. Since draft 5 that case is `409 request_in
    "reloads the collection", but not what it does with its pending writes based on versions it
    can no longer check. This client keeps them and sends them with their `If-Match`; if the item
    changed, the conflict kicks in.
-7. **`sync` without `writes`.** §1.2 makes `sync` require `query` but not `writes`. With draft 6,
+7. **`sync` without `writes`.** §1.2 makes `sync` require `query` but not `writes`. Since draft 6,
    §5.7 says when a `POST` can be repeated without `writes` (a client-chosen id); outside that, an
    offline client that creates needs `writes`.
 8. **Which `sync` text a client knows (§1.2).** This client implements the one from
-   `1.0-draft.6`. When `1.0` is published, will its `sync` be the same text? Until that is known,
+   `1.0-draft.7`. When `1.0` is published, will its `sync` be the same text? Until that is known,
    an API declaring `"1.0"` is reloaded in full. It is also unclear whether a `state` stored under
    one draft is valid after the server declares another: this client tries it and, if it gets
    `410` or `invalid_parameter` on `since`, reloads.
@@ -274,11 +312,18 @@ retried it a few times on a `create`. Since draft 5 that case is `409 request_in
     `409 taken` the client reads the item to find out whether its first attempt arrived, but
     reading it only says it exists. With a UUID v4 a collision is negligible, and this client
     takes it as its own if it had already tried to send it.
+11. **Language of the copy (§10).** A copy is in one language, but the server may fill a
+    localized field with another language's text where the map lacks the one asked for (§3).
+    This client stores the language it asked for, not the `Content-Language` it got.
+12. **A `create` past the ttl (§5.7).** Settled in draft 7: without a client-chosen `id` the
+    outcome stays uncertain unless the client establishes it another way (a filter by a unique
+    field, the `created` of `sync`). This client leaves it uncertain and lets the application
+    decide: it can look for the item and call `discard(opId)`, or `sync({ retryUncertain: true })`.
 
 ## Code and issues
 
 Code and issues: <https://github.com/restep-spec/restep-sync>. That repository is generated from the Restep
-site, where the tool is developed alongside the [specification](https://restep.wubytes.com/1/) and the reference
+site, where the tool is developed alongside the [specification](https://w3id.org/restep/1/) and the reference
 server: `vendor/` and `schema/` are copies from the site so the tests run on their own.
 
 MIT licensed.

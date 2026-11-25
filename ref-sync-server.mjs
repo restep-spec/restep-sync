@@ -1,27 +1,27 @@
 #!/usr/bin/env node
-// Copia del servidor de referencia (vendor/restep-server.mjs, borrador 6) con el perfil sync (§10)
-// añadido, para probar restep-sync. El servidor de referencia no implementa sync: este archivo lee su código,
-// le aplica unos parches de texto y escribe el resultado en un directorio temporal. No toca el original.
+// Copy of the reference server (vendor/restep-server.mjs, draft 7) with the sync profile (§10)
+// added, to test restep-sync. The reference server does not implement sync: this file reads its code,
+// applies some text patches to it and writes the result to a temporary directory. It does not touch the original.
 //
-// Uso:
-//   node tools/restep-sync/ref-sync-server.mjs            arranca la copia en PORT (por defecto 8860)
-//   import { buildSyncServer } from './ref-sync-server.mjs'  devuelve la ruta del archivo generado
+// Usage:
+//   node tools/restep-sync/ref-sync-server.mjs            starts the copy on PORT (default 8860)
+//   import { buildSyncServer } from './ref-sync-server.mjs'  returns the path of the generated file
 //
-// Lo que añade:
-// - "sync" en profiles y, solo en las colecciones de SYNCED (books y categories), sync.retention en el
-//   descubrimiento: en el borrador 6 una colección solo está sincronizada si declara sync (§10). En las
-//   demás (products), :changes da 404 y sus respuestas no llevan state.
-// - state en cada respuesta de una colección sincronizada: "<época>.<secuencia>". La época cambia en cada arranque, así
-//   que un estado de un arranque anterior da 410 state_expired (los datos vuelven a la semilla).
-// - _etag en cada elemento de las respuestas de colección (§7.2), si la referencia no lo pone ya.
-// - Todas las páginas de un recorrido llevan el state de la primera (va en el cursor). Con el orden
-//   por defecto, el cursor lleva además el último id, así que borrar a mitad de recorrido no hace perder
-//   otro elemento (paginación por clave).
-// - GET /<colección>:changes?since=<state>, con has_more. SYNC_PAGE (variable de entorno, por defecto
-//   100) fija cuántos cambios del registro entran en una respuesta; SYNC_RETENTION, los segundos que se
-//   guardan (por defecto 604800).
-// Los cambios se detectan comparando la ETag de cada elemento al principio de cada petición, así que
-// también cuentan los que hace refresh() en los valores heredados (§11.6) o unlink() al borrar.
+// What it adds:
+// - "sync" in profiles and, only in the SYNCED collections (books and categories), sync.retention in
+//   discovery: since draft 6 a collection is synced only if it declares sync (§10). In the
+//   others (products), :changes gives 404 and their responses carry no state.
+// - state in every response of a synced collection: "<epoch>.<sequence>". The epoch changes on every start, so
+//   a state from an earlier start gives 410 state_expired (the data goes back to the seed).
+// - _etag on every item of collection responses (§7.2), if the reference does not already put it.
+// - Every page of a traversal carries the state of the first (it goes in the cursor). With the default
+//   order, the cursor also carries the last id, so deleting in the middle of a traversal does not make
+//   another item get lost (keyset pagination).
+// - GET /<collection>:changes?since=<state>, with has_more. SYNC_PAGE (environment variable, default
+//   100) sets how many log changes fit in a response; SYNC_RETENTION, the seconds they are
+//   kept (default 604800).
+// Changes are detected by comparing each item's ETag at the start of every request, so the ones made by
+// refresh() on inherited values (§11.6) or by unlink() on delete count too.
 import { readFile, writeFile, mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -31,7 +31,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 export const REFERENCE = join(here, 'vendor/restep-server.mjs');
 
 const SYNC_CODE = `
-// ── sync (§10), añadido por tools/restep-sync/ref-sync-server.mjs ────────────
+// ── sync (§10), added by tools/restep-sync/ref-sync-server.mjs ───────────────
 const SYNCED = (process.env.SYNCED ?? 'books,categories').split(',').filter(Boolean);
 const EPOCH = randomBytes(4).toString('hex');
 const SYNC_PAGE = Number(process.env.SYNC_PAGE ?? 100);
@@ -44,7 +44,7 @@ const stateOf = (n) => \`\${EPOCH}.\${lastSeq[n] ?? 0}\`;
 let lastCursor = null;
 function track() {
   for (const [n, c] of Object.entries(db)) {
-    if (!SYNCED.includes(n) || !c.rows) continue; // solo lo que declara sync (una subcolección no tiene rows propio)
+    if (!SYNCED.includes(n) || !c.rows) continue; // only what declares sync (a subcollection has no rows of its own)
     const prev = snapshots.get(n);
     const now = new Map([...c.rows].map(([id, r]) => [id, etag(r)]));
     const log = (id, kind) => { seq++; lastSeq[n] = seq; changeLog.push({ seq, coll: n, id, kind, at: Date.now() }); };
@@ -74,8 +74,8 @@ function changes(n, params, req, res, method) {
   if (from > seq) throw bad('since', t('That state is in the future.', 'Ese estado es del futuro.'));
   const entries = changeLog.filter((e) => e.coll === n && e.seq > from);
   const page = entries.slice(0, SYNC_PAGE), has_more = entries.length > SYNC_PAGE;
-  // La lista la elige la visibilidad (10): se veía en since si su primer evento no es crearlo; borrado
-  // al final va a destroyed (también si se creó entre medias); si no, updated o created.
+  // The list is chosen by visibility (10): it was seen at since if its first event is not creating it; deleted
+  // at the end goes to destroyed (also if it was created in between); otherwise updated or created.
   const seen = new Map();
   for (const e of page) seen.set(e.id, { first: seen.get(e.id)?.first ?? e.kind, last: e.kind });
   const kinds = new Map([...seen].map(([id, { first, last }]) =>
@@ -87,8 +87,8 @@ function changes(n, params, req, res, method) {
 }
 `;
 
-// [buscar, reemplazar]. Cada búsqueda tiene que aparecer exactamente una vez: si el servidor de
-// referencia cambia y un parche ya no encaja, falla en voz alta en vez de generar algo a medias.
+// [find, replace]. Each search has to appear exactly once: if the reference server
+// changes and a patch no longer fits, it fails loudly instead of generating something half-done.
 const PATCHES = [
   ["const PROFILES = ['core', 'query', 'writes', 'cache', 'relations'];", "const PROFILES = ['core', 'query', 'writes', 'cache', 'relations', 'sync'];"],
   ['let nextId = 100;\n', 'let nextId = 100;\n' + SYNC_CODE],
@@ -102,16 +102,16 @@ const PATCHES = [
     "    const i = items.findIndex((r) => compare('string', r.id, cur.k) > 0);\n    offset = i < 0 ? items.length : i;\n  }"],
   ["    q.set('cursor', makeCursor(offset + limit, print));",
     "    q.set('cursor', makeCursor(offset + limit, print, { s: collState, k: page[page.length - 1].id }));"],
-  // §7.2: en una colección sincronizada, cada elemento lleva su _etag en todas las páginas. Si la
-  // referencia ya lo pone (lo hace desde el borrador 5), se deja; si no, se añade.
+  // §7.2: in a synced collection, every item carries its _etag on all pages. If the
+  // reference already puts it (it does since draft 5), it is left; otherwise it is added.
   [/^ {4}items: (.+), next,$/m, (_, items) =>
     `    items: ${items.includes('_etag') ? items : items.replace('pick(r, fields)', '({ ...pick(r, fields), _etag: etag(r) })')}, next,\n` +
     '    ...(SYNCED.includes(nameOf(coll)) && { state: collState }),'],
   ['  refresh(); // 11.6', '  refresh(); track(); // 11.6'],
   ['refresh();\nconst port', 'refresh(); track();\nconst port'],
   ['  if (action !== undefined) return handleAction(req, res, { url, params, coll, collPath, id, action });',
-    // §10: solo una colección sincronizada responde :changes; en las demás (también en una subcolección), la
-    // referencia lo trata como una acción que no declara: 404.
+    // §10: only a synced collection answers :changes; in the others (also in a subcollection), the
+    // reference treats it as an action it does not declare: 404.
     "  if (action === 'changes' && id === undefined && !coll.base && SYNCED.includes(nameOf(coll))) return changes(nameOf(coll), params, req, res, method);\n" +
     '  if (action !== undefined) return handleAction(req, res, { url, params, coll, collPath, id, action });'],
   ['      path: c.path ?? `/${n}`, ', '      path: c.path ?? `/${n}`, ...(SYNCED.includes(n) && { sync: { retention: RETENTION } }), '],
@@ -121,7 +121,7 @@ export async function buildSyncServer(source = REFERENCE) {
   let code = await readFile(source, 'utf8');
   for (const [find, replace] of PATCHES) {
     const n = typeof find === 'string' ? code.split(find).length - 1 : (code.match(new RegExp(find.source, `${find.flags}g`)) ?? []).length;
-    if (n !== 1) throw new Error(`ref-sync-server: el parche no encaja (${n} apariciones) en ${source}:\n${find}`);
+    if (n !== 1) throw new Error(`ref-sync-server: the patch does not fit (${n} occurrences) in ${source}:\n${find}`);
     code = typeof find === 'string' ? code.replace(find, () => replace) : code.replace(find, replace);
   }
   const dir = await mkdtemp(join(tmpdir(), 'restep-sync-server-'));

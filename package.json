@@ -1,6 +1,6 @@
 {
   "name": "restep-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Offline-first client for Restep 1 APIs: a local replica with the sync profile and a write queue",
   "type": "module",
   "main": "restep-sync.mjs",
